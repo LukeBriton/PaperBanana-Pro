@@ -27,22 +27,28 @@ from typing import Literal
 class ExpConfig:
     """Experiment configuration"""
 
-    dataset_name: Literal["PaperBananaBench"]
+    dataset_name: str
     task_name: Literal["diagram", "plot"] = "diagram"
     split_name: str = "test"
     temperature: float = 1.0
     exp_mode: str = ""
     retrieval_setting: Literal["auto", "manual", "random", "none"] = "auto"
     max_critic_rounds: int = 3
+    concurrency_mode: Literal["auto", "manual"] = "auto"
+    max_concurrent: int = 20
     model_name: str = ""
     image_model_name: str = ""
+    provider: str = "evolink"
     work_dir: Path = Path(__file__).parent.parent
 
     timestamp: str | None = None
 
     def __post_init__(self):
         os.environ["TZ"] = "America/Los_Angeles" # set the timezone as you like
-        time.tzset()  # Only needed once after setting TZ
+        try:
+            time.tzset()  # Only needed once after setting TZ (Unix only)
+        except AttributeError:
+            pass  # Windows doesn't have time.tzset()
         
         # Fallback to yaml config if no model_name provided
         if not self.model_name or not self.image_model_name:

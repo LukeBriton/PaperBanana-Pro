@@ -24,6 +24,7 @@ import re
 from google.genai import types
 
 from prompts import diagram_eval_prompts, plot_eval_prompts
+from utils import image_utils
 from utils.generation_utils import (
     call_gemini_with_retry_async,
     call_claude_with_retry_async,
@@ -123,7 +124,9 @@ async def _run_single_eval_ref(
     raw_content: str,
     visual_intent: str,
     gt_image_base64: str,
+    gt_image_mime: str,
     model_image_base64: str,
+    model_image_mime: str,
     model_name: str
 ) -> tuple[str, dict]:
     """Run a single evaluation dimension for referenced comparison."""
@@ -149,7 +152,7 @@ async def _run_single_eval_ref(
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/jpeg",
+                "media_type": gt_image_mime,
                 "data": gt_image_base64,
             },
         },
@@ -158,7 +161,7 @@ async def _run_single_eval_ref(
             "type": "image",
             "source": {
                 "type": "base64",
-                "media_type": "image/jpeg",
+                "media_type": model_image_mime,
                 "data": model_image_base64,
             },
         },
@@ -257,7 +260,9 @@ async def get_score_for_image_referenced(
         path_to_gt_image = Path(path_to_gt_image_rel)
 
     with open(path_to_gt_image, "rb") as f:
-        gt_image_base64 = base64.b64encode(f.read()).decode("utf-8")
+        gt_image_bytes = f.read()
+    gt_image_base64 = base64.b64encode(gt_image_bytes).decode("utf-8")
+    gt_image_mime = image_utils.detect_image_mime_from_bytes(gt_image_bytes)
 
     eval_image_field = sample_data["eval_image_field"]
     
@@ -271,6 +276,12 @@ async def get_score_for_image_referenced(
         return sample_data
     
     model_image_base64 = sample_data[eval_image_field]
+    model_image_mime_key = (
+        eval_image_field.replace("_base64_jpg", "_mime_type")
+        if eval_image_field.endswith("_base64_jpg")
+        else f"{eval_image_field}_mime_type"
+    )
+    model_image_mime = sample_data.get(model_image_mime_key, "image/jpeg")
 
     # Run evaluations for all dimensions
     dims = ["faithfulness", "conciseness", "readability", "aesthetics"]
@@ -281,7 +292,9 @@ async def get_score_for_image_referenced(
             raw_content,
             visual_intent,
             gt_image_base64,
+            gt_image_mime,
             model_image_base64,
+            model_image_mime,
             model_name
         ) for dim in dims
     ]

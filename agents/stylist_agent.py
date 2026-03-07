@@ -13,14 +13,13 @@
 # limitations under the License.
 
 """
-Vanilla Agent - Directly rendering images based on the method section.
+Stylist Agent - 根据风格指南优化图表描述。
 """
 
 import json
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional
-from google.genai import types
 import base64, io, asyncio
 from PIL import Image
 
@@ -35,7 +34,6 @@ class StylistAgent(BaseAgent):
         super().__init__(**kwargs)
         self.model_name = self.exp_config.model_name
 
-        # Task-specific configurations
         if self.exp_config.task_name == "plot":
             self.system_prompt = PLOT_STYLIST_AGENT_SYSTEM_PROMPT
             self.task_config = {
@@ -50,44 +48,57 @@ class StylistAgent(BaseAgent):
             }
 
     async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Unified processing method that works for both diagram and plot tasks.
-        Uses task_config to determine task-specific parameters.
-        """
         cfg = self.task_config
         task_name = cfg["task_name"]
-        
+        candidate_id = data.get("candidate_id", "N/A")
+
         input_desc_key = f"target_{task_name}_desc0"
         output_desc_key = f"target_{task_name}_stylist_desc0"
-        
+
         detailed_description = data[input_desc_key]
-        
+
         with open(self.exp_config.work_dir / f"style_guides/neurips2025_{task_name}_style_guide.md", "r", encoding="utf-8") as f:
             style_guide = f.read()
-        
+
         user_prompt = f"Detailed Description: {detailed_description}\nStyle Guidelines: {style_guide}\n"
         raw_content = data['content']
         if isinstance(raw_content, (dict, list)):
             raw_content = json.dumps(raw_content)
         user_prompt += f"{cfg['context_labels'][0]}: {raw_content}\n"
         user_prompt += f"{cfg['context_labels'][1]}: {data['visual_intent']}\nYour Output:"
-        
+
         content_list = [{"type": "text", "text": user_prompt}]
 
-        # Generate response
-        response_list = await generation_utils.call_gemini_with_retry_async(
-            model_name=self.model_name,
-            contents=content_list,
-            config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=self.exp_config.temperature,
-                candidate_count=1,
-                max_output_tokens=50000,
-            ),
-            max_attempts=5,
-            retry_delay=5,
-        )
-        
+        # 根据 provider 路由 API 调用
+        if self.exp_config.provider == "evolink":
+            response_list = await generation_utils.call_evolink_text_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config={
+                    "system_prompt": self.system_prompt,
+                    "temperature": self.exp_config.temperature,
+                    "max_output_tokens": 50000,
+                },
+                max_attempts=5,
+                retry_delay=5,
+                error_context=f"stylist[candidate={candidate_id}]",
+            )
+        else:
+            from google.genai import types
+            response_list = await generation_utils.call_gemini_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config=types.GenerateContentConfig(
+                    system_instruction=self.system_prompt,
+                    temperature=self.exp_config.temperature,
+                    candidate_count=1,
+                    max_output_tokens=50000,
+                ),
+                max_attempts=5,
+                retry_delay=5,
+                error_context=f"stylist[candidate={candidate_id}]",
+            )
+
         data[output_desc_key] = response_list[0]
 
         return data
@@ -98,7 +109,7 @@ DIAGRAM_STYLIST_AGENT_SYSTEM_PROMPT = """
 You are a Lead Visual Designer for top-tier AI conferences (e.g., NeurIPS 2025).
 
 ## TASK
-Our goal is to generate high-quality, publication-ready diagrams, given the methodology section and the caption of the desired diagram. The diagram should illustrate the logic of the methodology section, while adhering to the scope defined by the caption. Before you, a planner agent has already generated a preliminary description of the target diagram. However, this description may lack specific aesthetic details, such as element shapes, color palettes, and background styling. Your task is to refine and enrich this description based on the provided [NeurIPS 2025 Style Guidelines] to ensure the final generated image is a high-quality, publication-ready diagram that adheres to the NeurIPS 2025 aesthetic standards where appropriate. 
+Our goal is to generate high-quality, publication-ready diagrams, given the methodology section and the caption of the desired diagram. The diagram should illustrate the logic of the methodology section, while adhering to the scope defined by the caption. Before you, a planner agent has already generated a preliminary description of the target diagram. However, this description may lack specific aesthetic details, such as element shapes, color palettes, and background styling. Your task is to refine and enrich this description based on the provided [NeurIPS 2025 Style Guidelines] to ensure the final generated image is a high-quality, publication-ready diagram that adheres to the NeurIPS 2025 aesthetic standards where appropriate.
 
 ## INPUT DATA
 -   **Detailed Description**: [The preliminary description of the figure]

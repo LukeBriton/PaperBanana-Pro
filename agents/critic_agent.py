@@ -13,12 +13,11 @@
 # limitations under the License.
 
 """
-Vanilla Agent - Directly rendering images based on the method section.
+Critic Agent - 评审和改进图表描述。
 """
 
 import json
 from typing import Dict, Any
-from google.genai import types
 import base64, io, asyncio
 from PIL import Image
 import json_repair
@@ -34,7 +33,6 @@ class CriticAgent(BaseAgent):
         super().__init__(**kwargs)
         self.model_name = self.exp_config.model_name
 
-        # Task-specific configurations
         if self.exp_config.task_name == "plot":
             self.system_prompt = PLOT_CRITIC_AGENT_SYSTEM_PROMPT
             self.task_config = {
@@ -51,60 +49,55 @@ class CriticAgent(BaseAgent):
             }
 
     async def process(self, data: Dict[str, Any], source: str = "stylist") -> Dict[str, Any]:
-        """
-        Unified processing method for both diagram and plot critique.
-        Uses task_config to determine task-specific parameters.
-        
-        Args:
-            data: Input data dictionary
-            source: Source of the input for round 0 critique. 
-                   - "stylist": Use stylist output (default for backward compatibility)
-                   - "planner": Use planner output (for planner-critic workflow)
-        """
         cfg = self.task_config
         task_name = cfg["task_name"]
-        
+
         round_idx = data.get("current_critic_round", 0)
-        
+        candidate_id = data.get("candidate_id", "N/A")
+        print(f"[DEBUG] [CriticAgent] 开始处理, round={round_idx}, source={source}, provider={self.exp_config.provider}")
+
         if round_idx == 0:
-            # First round: use specified source (stylist or planner)
             if source == "stylist":
                 desc_key = f"target_{task_name}_stylist_desc0"
                 base64_key = f"target_{task_name}_stylist_desc0_base64_jpg"
+                mime_key = f"target_{task_name}_stylist_desc0_mime_type"
             elif source == "planner":
                 desc_key = f"target_{task_name}_desc0"
                 base64_key = f"target_{task_name}_desc0_base64_jpg"
+                mime_key = f"target_{task_name}_desc0_mime_type"
             else:
                 raise ValueError(f"Invalid source '{source}'. Must be 'stylist' or 'planner'.")
-            
+
             detailed_description = data[desc_key]
             image_base64 = data.get(base64_key)
+            image_mime = data.get(mime_key, "image/jpeg")
         else:
-            # Subsequent rounds: use previous critic output
             desc_key = f"target_{task_name}_critic_desc{round_idx - 1}"
             base64_key = f"target_{task_name}_critic_desc{round_idx - 1}_base64_jpg"
+            mime_key = f"target_{task_name}_critic_desc{round_idx - 1}_mime_type"
             detailed_description = data[desc_key]
             image_base64 = data.get(base64_key)
-        
+            image_mime = data.get(mime_key, "image/jpeg")
+
         content = data["content"]
         if isinstance(content, (dict, list)):
             content = json.dumps(content)
         visual_intent = data["visual_intent"]
         content_list = [{"type": "text", "text": cfg["critique_target"]}]
-        
+
         if image_base64 and len(image_base64) > 100:
             content_list.append({
                 "type": "image",
                 "source": {
                     "type": "base64",
                     "data": image_base64,
-                    "media_type": "image/jpeg",
+                    "media_type": image_mime,
                 },
             })
         else:
-            print(f"⚠️ [Critic] No valid image found for round {round_idx}. Using text-only critique mode.")
+            print(f"[WARN] [Critic] No valid image found for round {round_idx}. Using text-only critique mode.")
             content_list.append({
-                "type": "text", 
+                "type": "text",
                 "text": "\n[SYSTEM NOTICE] The plot image could not be generated based on the current description (likely due to invalid code). Please check the description for errors (e.g., syntax issues, missing data) and provide a revised version."
             })
 
@@ -113,19 +106,36 @@ class CriticAgent(BaseAgent):
             "text": f"Detailed Description: {detailed_description}\n{cfg['context_labels'][0]}: {content}\n{cfg['context_labels'][1]}: {visual_intent}\nYour Output:",
         })
 
-        response_list = await generation_utils.call_gemini_with_retry_async(
-            model_name=self.model_name,
-            contents=content_list,
-            config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=self.exp_config.temperature,
-                candidate_count=1,
-                max_output_tokens=50000,
-            ),
-            max_attempts=5,
-            retry_delay=5,
-        )
-        
+        # 根据 provider 路由 API 调用
+        if self.exp_config.provider == "evolink":
+            response_list = await generation_utils.call_evolink_text_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config={
+                    "system_prompt": self.system_prompt,
+                    "temperature": self.exp_config.temperature,
+                    "max_output_tokens": 50000,
+                },
+                max_attempts=5,
+                retry_delay=5,
+                error_context=f"critic[candidate={candidate_id},round={round_idx}]",
+            )
+        else:
+            from google.genai import types
+            response_list = await generation_utils.call_gemini_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config=types.GenerateContentConfig(
+                    system_instruction=self.system_prompt,
+                    temperature=self.exp_config.temperature,
+                    candidate_count=1,
+                    max_output_tokens=50000,
+                ),
+                max_attempts=5,
+                retry_delay=5,
+                error_context=f"critic[candidate={candidate_id},round={round_idx}]",
+            )
+
         cleaned_response = (
             response_list[0].replace("```json", "").replace("```", "").strip()
         )
@@ -139,12 +149,15 @@ class CriticAgent(BaseAgent):
 
         critic_suggestions = eval_result.get("critic_suggestions", "No changes needed.")
         revised_description = eval_result.get("revised_description", "No changes needed.")
-        
+
         data[f"target_{task_name}_critic_suggestions{round_idx}"] = critic_suggestions
         data[f"target_{task_name}_critic_desc{round_idx}"] = revised_description
 
         if revised_description.strip() == "No changes needed.":
             data[f"target_{task_name}_critic_desc{round_idx}"] = detailed_description
+            print(f"[DEBUG] [CriticAgent] round={round_idx}: 无需修改")
+        else:
+            print(f"[DEBUG] [CriticAgent] round={round_idx}: 建议长度={len(critic_suggestions)}, 修订描述长度={len(revised_description)}")
 
         return data
 

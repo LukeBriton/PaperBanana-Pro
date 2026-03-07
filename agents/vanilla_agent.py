@@ -13,13 +13,11 @@
 # limitations under the License.
 
 """
-Vanilla Agent - Directly rendering images based on the method section and diagram caption,
-or writing code to generate plots based on the raw data and plot caption.
+Vanilla Agent - 直接根据方法章节和图注生成图像或代码。
 """
 
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
-from google.genai import types
 import base64, io, asyncio
 from PIL import Image
 import json
@@ -72,14 +70,14 @@ class VanillaAgent(BaseAgent):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        
+
         if "plot" in self.exp_config.task_name:
             self.model_name = self.exp_config.model_name
             self.system_prompt = PLOT_VANILLA_AGENT_SYSTEM_PROMPT
             self.process_executor = ProcessPoolExecutor(max_workers=32)
             self.task_config = {
                 "task_name": "plot",
-                "use_image_generation": False,  # Use code generation
+                "use_image_generation": False,
                 "content_label": "Plot Raw Data",
                 "visual_intent_label": "Visual Intent of the Desired Plot",
             }
@@ -89,7 +87,7 @@ class VanillaAgent(BaseAgent):
             self.process_executor = None
             self.task_config = {
                 "task_name": "diagram",
-                "use_image_generation": True, # Use image generation
+                "use_image_generation": True,
                 "content_label": "Method Section",
                 "visual_intent_label": "Diagram Caption",
             }
@@ -99,42 +97,67 @@ class VanillaAgent(BaseAgent):
             self.process_executor.shutdown(wait=True)
 
     async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generate image based on the user prompt.
-        Supports both diagram (image generation) and plot (matplotlib code generation).
-        """
         cfg = self.task_config
-        
+
         raw_content = data["content"]
         content = json.dumps(raw_content) if isinstance(raw_content, (dict, list)) else raw_content
         visual_intent = data["visual_intent"]
-        
+
         prompt_text = f"**{cfg['content_label']}**: {content}\n**{cfg['visual_intent_label']}**: {visual_intent}\n"
         if cfg['task_name'] == 'diagram':
             prompt_text += "Note that do not include figure titles in the image."
-        
+
         if cfg["use_image_generation"]:
             prompt_text += "**Generated Diagram**: "
         else:
             prompt_text += "\nUse python matplotlib to generate a statistical plot based on the above information. Only provide the code without any explanations. Code:"
-        
+
         content_list = [{"type": "text", "text": prompt_text}]
-        
-        gen_config_args = {
-            "system_instruction": self.system_prompt,
-            "temperature": self.exp_config.temperature,
-            "candidate_count": 1,
-            "max_output_tokens": 50000,
-        }
-        
-        if cfg["use_image_generation"]:
-            gen_config_args["response_modalities"] = ["IMAGE"]
-            gen_config_args["image_config"] = types.ImageConfig(
-                aspect_ratio=data["additional_info"]["rounded_ratio"],
-                image_size="1k",
-            )
-        
-        if "gemini" in self.model_name:
+
+        # 根据 provider 路由 API 调用
+        if self.exp_config.provider == "evolink":
+            if cfg["use_image_generation"]:
+                aspect_ratio = data.get("additional_info", {}).get("rounded_ratio", "1:1")
+                response_list = await generation_utils.call_evolink_image_with_retry_async(
+                    model_name=self.model_name,
+                    prompt=prompt_text,
+                    config={
+                        "aspect_ratio": aspect_ratio,
+                        "quality": "2K",
+                    },
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+            else:
+                response_list = await generation_utils.call_evolink_text_with_retry_async(
+                    model_name=self.model_name,
+                    contents=content_list,
+                    config={
+                        "system_prompt": self.system_prompt,
+                        "temperature": self.exp_config.temperature,
+                        "max_output_tokens": 50000,
+                    },
+                    max_attempts=5,
+                    retry_delay=30,
+                )
+        elif "gemini" in self.model_name:
+            from google.genai import types
+            gen_config_args = {
+                "system_instruction": self.system_prompt,
+                "temperature": self.exp_config.temperature,
+                "candidate_count": 1,
+                "max_output_tokens": 50000,
+            }
+            if cfg["use_image_generation"]:
+                gemini_image_size = image_utils.normalize_gemini_image_size(
+                    data.get("additional_info", {}).get("image_resolution", "1K"),
+                    default_size="1K",
+                )
+                gen_config_args["response_modalities"] = ["IMAGE"]
+                gen_config_args["image_config"] = types.ImageConfig(
+                    aspect_ratio=data["additional_info"]["rounded_ratio"],
+                    image_size=gemini_image_size,
+                )
             response_list = await generation_utils.call_gemini_with_retry_async(
                 model_name=self.model_name,
                 contents=content_list,
@@ -151,17 +174,21 @@ class VanillaAgent(BaseAgent):
             }
             response_list = await generation_utils.call_openai_image_generation_with_retry_async(
                 model_name=self.model_name,
-                prompt=prompt_text[:30000], # OpenAI GPT-Image-1.5 only supports input string length up to 32000
+                prompt=prompt_text[:30000],
                 config=image_config,
                 max_attempts=5,
                 retry_delay=30,
             )
         else:
             raise ValueError(f"Unsupported model: {self.model_name}")
-        
+
         output_key = f"vanilla_{cfg['task_name']}_base64_jpg"
+        mime_key = f"vanilla_{cfg['task_name']}_mime_type"
         if cfg["use_image_generation"]:
-            data[output_key] = await asyncio.to_thread(image_utils.convert_png_b64_to_jpg_b64, response_list[0])
+            raw_image_b64 = response_list[0] if response_list else None
+            if raw_image_b64 and raw_image_b64 != "Error":
+                data[output_key] = raw_image_b64
+                data[mime_key] = image_utils.detect_image_mime_from_b64(raw_image_b64)
         else:
             if response_list and response_list[0]:
                 raw_code = response_list[0]
@@ -171,6 +198,7 @@ class VanillaAgent(BaseAgent):
                 )
                 if base64_jpg:
                     data[output_key] = base64_jpg
+                    data[mime_key] = "image/jpeg"
 
         return data
 
@@ -189,7 +217,7 @@ The "Diagram Caption" is provided solely to describe the visual content and logi
 -   **Method Section**: [Content of method section]
 -   **Diagram Caption**: [Diagram caption]
 ## OUTPUT
-Generate a single, high-resolution image that visually explains the method and aligns well with the caption. 
+Generate a single, high-resolution image that visually explains the method and aligns well with the caption.
 """
 
 PLOT_VANILLA_AGENT_SYSTEM_PROMPT = """

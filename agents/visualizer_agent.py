@@ -13,12 +13,11 @@
 # limitations under the License.
 
 """
-Vanilla Agent - Directly rendering images based on the method section.
+Visualizer Agent - 将详细描述转换为图像或代码。
 """
 
 from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any
-from google.genai import types
 import base64, io, asyncio, re
 import matplotlib.pyplot as plt
 from PIL import Image
@@ -60,12 +59,27 @@ def _execute_plot_code_worker(code_text: str) -> str:
         return None
 
 
+def _safe_preview_for_log(value, max_len: int = 20) -> str:
+    """
+    Build an ASCII-safe preview string for logging.
+    This avoids Windows stdout failures caused by invalid characters.
+    """
+    try:
+        if isinstance(value, (bytes, bytearray)):
+            return ascii(bytes(value[:max_len]))
+        if isinstance(value, str):
+            return ascii(value[:max_len])
+        return ascii(str(value)[:max_len])
+    except Exception:
+        return "<unprintable>"
+
+
 class VisualizerAgent(BaseAgent):
     """Visualizer Agent to generate images based on user queries"""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        
+
         # Task-specific configurations
         if "plot" in self.exp_config.task_name:
             self.model_name = self.exp_config.model_name
@@ -73,28 +87,17 @@ class VisualizerAgent(BaseAgent):
             self.process_executor = ProcessPoolExecutor(max_workers=32)
             self.task_config = {
                 "task_name": "plot",
-                "use_image_generation": False,  # Use code generation instead
+                "use_image_generation": False,
                 "prompt_template": "Use python matplotlib to generate a statistical plot based on the following detailed description: {desc}\n Only provide the code without any explanations. Code:",
                 "max_output_tokens": 50000,
             }
-            # The code below is for applying image generation models to statistics plots:
-            # self.model_name = self.exp_config.image_model_name
-            # self.system_prompt = """You are an expert statistical plot illustrator. Generate high-quality statistical plots based on user requests. Note that you should not use code, but directly generate the image."""
-            # self.process_executor = None
-            # self.task_config = {
-            #     "task_name": "plot",
-            #     "use_image_generation": True,  # Use direct image generation
-            #     "prompt_template": "Render an image based on the following description: {desc}\n Plot:",
-            #     "max_output_tokens": 50000,
-            # }
-
         else:
             self.model_name = self.exp_config.image_model_name
             self.system_prompt = DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT
-            self.process_executor = None  # Not needed for diagrams
+            self.process_executor = None
             self.task_config = {
                 "task_name": "diagram",
-                "use_image_generation": True,  # Use direct image generation
+                "use_image_generation": True,
                 "prompt_template": "Render an image based on the following detailed description: {desc}\n Note that do not include figure titles in the image. Diagram: ",
                 "max_output_tokens": 50000,
             }
@@ -104,13 +107,11 @@ class VisualizerAgent(BaseAgent):
             self.process_executor.shutdown(wait=True)
 
     async def process(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Unified processing method that works for both diagram and plot tasks.
-        Uses task_config to determine task-specific parameters.
-        """
         cfg = self.task_config
         task_name = cfg["task_name"]
-        
+        candidate_id = data.get("candidate_id", "N/A")
+        print(f"[DEBUG] [VisualizerAgent] 开始处理, task={task_name}, provider={self.exp_config.provider}, model={self.model_name}, 图像生成={cfg['use_image_generation']}")
+
         desc_keys_to_process = []
         for key in [
             f"target_{task_name}_desc0",
@@ -118,56 +119,104 @@ class VisualizerAgent(BaseAgent):
         ]:
             if key in data and f"{key}_base64_jpg" not in data:
                 desc_keys_to_process.append(key)
-        
+
         for round_idx in range(3):
             key = f"target_{task_name}_critic_desc{round_idx}"
             if key in data and f"{key}_base64_jpg" not in data:
                 critic_suggestions_key = f"target_{task_name}_critic_suggestions{round_idx}"
                 critic_suggestions = data.get(critic_suggestions_key, "")
-                
+
                 if critic_suggestions.strip() == "No changes needed." and round_idx > 0:
-                    # Reuse previous round's base64
                     prev_base64_key = f"target_{task_name}_critic_desc{round_idx - 1}_base64_jpg"
+                    prev_mime_key = f"target_{task_name}_critic_desc{round_idx - 1}_mime_type"
                     if prev_base64_key in data:
                         data[f"{key}_base64_jpg"] = data[prev_base64_key]
+                        if prev_mime_key in data:
+                            data[f"{key}_mime_type"] = data[prev_mime_key]
                         print(f"[Visualizer] Reused base64 from round {round_idx - 1} for {key}")
                         continue
-                
+
                 desc_keys_to_process.append(key)
-        
+
         if not cfg["use_image_generation"]:
             loop = asyncio.get_running_loop()
-        
+
+        print(f"[DEBUG] [VisualizerAgent] 待处理 desc_keys: {desc_keys_to_process}")
+
         for desc_key in desc_keys_to_process:
             prompt_text = cfg["prompt_template"].format(desc=data[desc_key])
             content_list = [{"type": "text", "text": prompt_text}]
-            
-            gen_config_args = {
-                "system_instruction": self.system_prompt,
-                "temperature": self.exp_config.temperature,
-                "candidate_count": 1,
-                "max_output_tokens": cfg["max_output_tokens"],
-            }
-            
-            if cfg["use_image_generation"] and "gemini" in self.model_name:
-                # Default to 1:1 if aspect ratio is missing
-                aspect_ratio = "1:1"
-                if "additional_info" in data and "rounded_ratio" in data["additional_info"]:
-                    aspect_ratio = data["additional_info"]["rounded_ratio"]
+            print(f"[DEBUG] [VisualizerAgent] 处理 {desc_key}, prompt 长度={len(prompt_text)}")
 
-                gen_config_args["response_modalities"] = ["IMAGE"]
-                gen_config_args["image_config"] = types.ImageConfig(
-                    aspect_ratio=aspect_ratio,
-                    image_size="1k",
-                )
-            
-            if "gemini" in self.model_name:
+            # 根据 provider 路由 API 调用
+            if self.exp_config.provider == "evolink":
+                if cfg["use_image_generation"]:
+                    # Evolink 图像生成（异步任务模式）
+                    aspect_ratio = "1:1"
+                    image_resolution = "2K"  # 默认分辨率
+                    if "additional_info" in data:
+                        if "rounded_ratio" in data["additional_info"]:
+                            aspect_ratio = data["additional_info"]["rounded_ratio"]
+                        if "image_resolution" in data["additional_info"]:
+                            image_resolution = data["additional_info"]["image_resolution"]
+
+                    response_list = await generation_utils.call_evolink_image_with_retry_async(
+                        model_name=self.model_name,
+                        prompt=prompt_text,
+                        config={
+                            "aspect_ratio": aspect_ratio,
+                            "quality": image_resolution,
+                        },
+                        max_attempts=5,
+                        retry_delay=30,
+                        error_context=f"visualizer-image[candidate={candidate_id},key={desc_key}]",
+                    )
+                else:
+                    # Evolink 文本生成（用于代码生成）
+                    response_list = await generation_utils.call_evolink_text_with_retry_async(
+                        model_name=self.exp_config.model_name,
+                        contents=content_list,
+                        config={
+                            "system_prompt": self.system_prompt,
+                            "temperature": self.exp_config.temperature,
+                            "max_output_tokens": cfg["max_output_tokens"],
+                        },
+                        max_attempts=5,
+                        retry_delay=30,
+                        error_context=f"visualizer-code[candidate={candidate_id},key={desc_key}]",
+                    )
+            elif "gemini" in self.model_name:
+                from google.genai import types
+                gen_config_args = {
+                    "system_instruction": self.system_prompt,
+                    "temperature": self.exp_config.temperature,
+                    "candidate_count": 1,
+                    "max_output_tokens": cfg["max_output_tokens"],
+                }
+                if cfg["use_image_generation"]:
+                    aspect_ratio = "1:1"
+                    image_resolution = "2K"  # 默认分辨率
+                    if "additional_info" in data:
+                        if "rounded_ratio" in data["additional_info"]:
+                            aspect_ratio = data["additional_info"]["rounded_ratio"]
+                        if "image_resolution" in data["additional_info"]:
+                            image_resolution = data["additional_info"]["image_resolution"]
+
+                    gemini_image_size = image_utils.normalize_gemini_image_size(
+                        image_resolution, default_size="1K"
+                    )
+                    gen_config_args["response_modalities"] = ["IMAGE"]
+                    gen_config_args["image_config"] = types.ImageConfig(
+                        aspect_ratio=aspect_ratio,
+                        image_size=gemini_image_size,
+                    )
                 response_list = await generation_utils.call_gemini_with_retry_async(
                     model_name=self.model_name,
                     contents=content_list,
                     config=types.GenerateContentConfig(**gen_config_args),
                     max_attempts=5,
                     retry_delay=30,
+                    error_context=f"visualizer[candidate={candidate_id},key={desc_key}]",
                 )
             elif "gpt-image" in self.model_name:
                 image_config = {
@@ -182,47 +231,58 @@ class VisualizerAgent(BaseAgent):
                     config=image_config,
                     max_attempts=5,
                     retry_delay=30,
+                    error_context=f"visualizer-openai[candidate={candidate_id},key={desc_key}]",
                 )
             else:
                 raise ValueError(f"Unsupported model: {self.model_name}")
-            
+
             if not response_list or not response_list[0]:
+                print(f"[DEBUG] [VisualizerAgent] [WARN] {desc_key}: API 返回空响应")
                 continue
-            
+
+            resp0 = response_list[0]
+            preview = _safe_preview_for_log(resp0, max_len=20)
+            try:
+                print(
+                    f"[DEBUG] [VisualizerAgent] {desc_key}: API 响应长度={len(resp0)}, 值前20字={preview}..."
+                )
+            except OSError as log_err:
+                # Avoid crashing the pipeline because of logging side effects.
+                try:
+                    print(f"[DEBUG] [VisualizerAgent] 日志输出异常，已跳过详细预览: {log_err!r}")
+                except Exception:
+                    pass
+
             # Post-process based on task type
             if cfg["use_image_generation"]:
-                # Convert PNG to JPG
-                converted_jpg = await asyncio.to_thread(
-                    image_utils.convert_png_b64_to_jpg_b64, response_list[0]
-                )
-                if converted_jpg:
-                    data[f"{desc_key}_base64_jpg"] = converted_jpg
+                raw_image_b64 = response_list[0]
+                if raw_image_b64 and raw_image_b64 != "Error":
+                    mime_type = image_utils.detect_image_mime_from_b64(raw_image_b64)
+                    data[f"{desc_key}_base64_jpg"] = raw_image_b64
+                    data[f"{desc_key}_mime_type"] = mime_type
+                    print(
+                        f"[DEBUG] [VisualizerAgent] [OK] {desc_key}_base64_jpg 已生成, "
+                        f"mime={mime_type}, 大小={len(raw_image_b64)}"
+                    )
                 else:
-                    print(f"⚠️  Skipping {desc_key}: image conversion failed")
+                    print(f"[DEBUG] [VisualizerAgent] [ERR] {desc_key}: 图像输出为空")
             else:
-                # Plot: execute generated code
                 raw_code = response_list[0]
-                
+
                 if not hasattr(self, "process_executor") or self.process_executor is None:
-                    print("Warning: Creating temporary ProcessPoolExecutor. Initialize one in __init__ for better performance.")
                     self.process_executor = ProcessPoolExecutor(max_workers=4)
-                
+
                 base64_jpg = await loop.run_in_executor(
                     self.process_executor, _execute_plot_code_worker, raw_code
                 )
                 data[f"{desc_key}_code"] = raw_code
-                
+
                 if base64_jpg:
                     data[f"{desc_key}_base64_jpg"] = base64_jpg
-        
+
         return data
 
 
 DIAGRAM_VISUALIZER_AGENT_SYSTEM_PROMPT = """You are an expert scientific diagram illustrator. Generate high-quality scientific diagrams based on user requests."""
 
 PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT = """You are an expert statistical plot illustrator. Write code to generate high-quality statistical plots based on user requests."""
-
-
-# !!! Note: If using image generation models, use the following system prompt instead:
-
-# PLOT_VISUALIZER_AGENT_SYSTEM_PROMPT = """You are an expert statistical plot illustrator. Generate high-quality statistical plots based on user requests. Note that you should not use code, but directly generate the image."""

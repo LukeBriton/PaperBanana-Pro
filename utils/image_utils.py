@@ -21,6 +21,65 @@ import io
 from PIL import Image
 
 
+def detect_image_mime_from_bytes(image_bytes: bytes) -> str:
+    """
+    Detect MIME type from raw image bytes using file signatures.
+
+    Args:
+        image_bytes: Raw image bytes.
+
+    Returns:
+        MIME type string, defaults to image/jpeg when unknown.
+    """
+    if not image_bytes or len(image_bytes) < 12:
+        return "image/jpeg"
+
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+
+    return "image/jpeg"
+
+
+def detect_image_mime_from_b64(image_b64_str: str) -> str:
+    """
+    Detect MIME type from base64 encoded image content.
+
+    Args:
+        image_b64_str: Base64 image string (without data URL prefix).
+
+    Returns:
+        MIME type string, defaults to image/jpeg when unknown.
+    """
+    try:
+        raw_bytes = base64.b64decode(image_b64_str)
+    except Exception:
+        return "image/jpeg"
+    return detect_image_mime_from_bytes(raw_bytes)
+
+
+def normalize_gemini_image_size(image_size: str, default_size: str = "1K") -> str:
+    """
+    Normalize Gemini image size value to supported enum: 1K/2K/4K.
+
+    Args:
+        image_size: Input image size string.
+        default_size: Fallback when input is invalid.
+
+    Returns:
+        Normalized image size string.
+    """
+    normalized = (image_size or "").strip().upper()
+    if normalized in {"1K", "2K", "4K"}:
+        return normalized
+    return default_size
+
+
 def convert_png_b64_to_jpg_b64(png_b64_str: str) -> str:
     """
     Convert a PNG base64 string to a JPG base64 string.
