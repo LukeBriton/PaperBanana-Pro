@@ -24,7 +24,8 @@
 - When changing pipeline semantics, update viewers in the same batch.
 - Record architectural decisions and progress in `docs/agent-memory.md`.
 - Record prioritized follow-up work in `docs/optimization-backlog.md`.
-- Prefer the user's existing global/shared Python and `uv` environment for this repo.
+- Prefer the user's existing global `uv tool` environment for this repo, not the system-installed Python interpreter.
+- The canonical shared runtime for this workspace is the `paperbanana` uv tool environment at `C:\Users\86166\AppData\Roaming\uv\tools\paperbanana\Scripts\python.exe`.
 - Do not create a project-local `.venv` unless the user explicitly asks for a new virtual environment.
 
 ## Validation
